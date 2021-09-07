@@ -10,6 +10,11 @@
 void showError(LPCTSTR error) {
 	MessageBox(NULL, error, TEXT("Error"), MB_OK | MB_ICONERROR);
 }
+void ShowError(LPCTSTR title, const DWORD err) {
+	CHAR buff[1024];
+	FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT), buff, sizeof buff / sizeof(TCHAR), NULL);
+	MessageBoxA(NULL, buff, "title", MB_OK | MB_ICONERROR);
+}
 
 #ifdef DEBUG
 #pragma warning(push)
@@ -99,19 +104,24 @@ void enableShutdownPrivilege()
 	HANDLE hToken = NULL;
 	LUID luid;
 	OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken);
-	LookupPrivilegeValue(L"", SE_SHUTDOWN_NAME, &luid);
-	TOKEN_PRIVILEGES tp;
-	tp.PrivilegeCount = 1;
-	tp.Privileges[0].Luid = luid;
-	tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-	AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, 0);
+
+	CONST TCHAR *privileges[2] = { SE_SHUTDOWN_NAME, SE_REMOTE_SHUTDOWN_NAME };
+	for (int i = 0; i < 2; i++) {
+		LookupPrivilegeValue(L"", privileges[i], &luid);
+		TOKEN_PRIVILEGES tp;
+		tp.PrivilegeCount = 1;
+		tp.Privileges[0].Luid = luid;
+		tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+		if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, 0))
+			showError(TEXT("AdjustTokenPrivileges failed"));
+	}
 }
 
 void createService()
 {
 	SC_HANDLE scManager = OpenSCManagerA(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
 	if (!scManager) {
-		showError(TEXT("OpenSCManagerA failed"));
+		ShowError(TEXT("OpenSCManagerA failed"), GetLastError());
 		return;
 	}
 	PWSTR pathBase = NULL;
@@ -128,9 +138,12 @@ void createService()
 	buff[len] = 0;
 
 
+	ShowError(TEXT("Permission denied test"), 0x5);
 	CoTaskMemFree(pathBase);
-	SC_HANDLE service = CreateService(scManager, TEXT("Remote Shutdown Server"), TEXT("RemoteShutdownService"), SC_MANAGER_ALL_ACCESS, 0, 0, 0, buff, NULL, NULL, NULL, NULL, NULL);
 	showError(buff);
+	SC_HANDLE service = CreateService(scManager, TEXT("Remote Shutdown Server"), TEXT("RemoteShutdownService"), SC_MANAGER_ALL_ACCESS, 0, 0, 0, buff, NULL, NULL, NULL, NULL, NULL);
+	if (!service)
+		ShowError(TEXT("CreateService failed"), GetLastError());
 }
 
 void main() {
