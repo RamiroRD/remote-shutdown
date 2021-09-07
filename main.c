@@ -7,13 +7,16 @@
 #include <http.h>
 #include <stdio.h>
 
-void showError(LPCTSTR error) {
+static LPCTSTR ServiceName = TEXT("RemoteShutdown");
+
+static void ShowError(LPCTSTR error) {
 	MessageBox(NULL, error, TEXT("Error"), MB_OK | MB_ICONERROR);
 }
-void ShowError(LPCTSTR title, const DWORD err) {
-	CHAR buff[1024];
-	FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT), buff, sizeof buff / sizeof(TCHAR), NULL);
-	MessageBoxA(NULL, buff, "title", MB_OK | MB_ICONERROR);
+
+static void ShowWindowsError(LPCTSTR title, const DWORD err) {
+	TCHAR buff[1024];
+	FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT), buff, sizeof buff / sizeof(buff[0]), NULL);
+	MessageBox(NULL, buff, title, MB_OK | MB_ICONERROR);
 }
 
 #ifdef DEBUG
@@ -66,7 +69,7 @@ DWORD DoReceiveRequests(HANDLE hReqQueue) {
 			response.ReasonLength = (USHORT)strlen(reason);
 			result = HttpSendHttpResponse(hReqQueue, pRequest->RequestId, HTTP_SEND_RESPONSE_FLAG_DISCONNECT, &response, NULL, NULL, NULL, 0UL, NULL, NULL);
 			if (result != NO_ERROR)
-				showError(TEXT("Error sending HTTP response"));
+				ShowError(TEXT("Error sending HTTP response"));
 			continue;
 		}
 
@@ -93,36 +96,44 @@ DWORD DoReceiveRequests(HANDLE hReqQueue) {
 		chunk.FromMemory.BufferLength = (ULONG) strlen(responseBuffer);
 		result = HttpSendHttpResponse(hReqQueue, pRequest->RequestId, 0, &response, NULL, NULL, NULL, 0, NULL, NULL);
 		if (result != NO_ERROR)
-			showError(TEXT("HttpSendHttpResponse failed"));
+			ShowError(TEXT("HttpSendHttpResponse failed"));
 	}
 	return NO_ERROR;
 }
 #pragma warning(pop) 
 
-void enableShutdownPrivilege()
+DWORD EnablePrivileges()
 {
 	HANDLE hToken = NULL;
 	LUID luid;
-	OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken);
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken))
+		return GetLastError();
 
 	CONST TCHAR *privileges[2] = { SE_SHUTDOWN_NAME, SE_REMOTE_SHUTDOWN_NAME };
 	for (int i = 0; i < 2; i++) {
-		LookupPrivilegeValue(L"", privileges[i], &luid);
+		if (!LookupPrivilegeValue(L"", privileges[i], &luid))
+			return GetLastError();
 		TOKEN_PRIVILEGES tp;
 		tp.PrivilegeCount = 1;
 		tp.Privileges[0].Luid = luid;
 		tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-		if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, 0))
-			showError(TEXT("AdjustTokenPrivileges failed"));
+		if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, 0)) {
+			DWORD err = GetLastError();
+			ShowWindowsError(TEXT("AdjustTokenPrivileges failed"), err);
+			return err;
+		}
 	}
+
+	return NO_ERROR;
 }
 
-void createService()
+DWORD RegisterService()
 {
 	SC_HANDLE scManager = OpenSCManagerA(NULL, NULL, SC_MANAGER_CREATE_SERVICE);
 	if (!scManager) {
-		ShowError(TEXT("OpenSCManagerA failed"), GetLastError());
-		return;
+		DWORD err = GetLastError();
+		ShowWindowsError(TEXT("OpenSCManagerA failed"), err);
+		return err;
 	}
 	PWSTR pathBase = NULL;
 	SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, NULL, &pathBase);
@@ -138,12 +149,38 @@ void createService()
 	buff[len] = 0;
 
 
-	ShowError(TEXT("Permission denied test"), 0x5);
 	CoTaskMemFree(pathBase);
-	showError(buff);
-	SC_HANDLE service = CreateService(scManager, TEXT("Remote Shutdown Server"), TEXT("RemoteShutdownService"), SC_MANAGER_ALL_ACCESS, 0, 0, 0, buff, NULL, NULL, NULL, NULL, NULL);
-	if (!service)
-		ShowError(TEXT("CreateService failed"), GetLastError());
+	SC_HANDLE oldService = OpenService(scManager, ServiceName, SERVICE_ALL_ACCESS);
+	if (!oldService) {
+		DWORD err = GetLastError();
+		if (err != ERROR_SERVICE_DOES_NOT_EXIST) {
+			ShowWindowsError(TEXT("Failed to open the old service"), err);
+			return err;
+		}
+	} else {
+		if (!DeleteService(oldService)) {
+			DWORD err = GetLastError();
+			ShowWindowsError(TEXT("Failed to delete old service"), err);
+			return err;
+		}
+	}
+	SC_HANDLE service = CreateService(
+		scManager,
+		ServiceName,
+		TEXT("Remote Shutdown Service"),
+		SERVICE_ALL_ACCESS,
+		SERVICE_WIN32_OWN_PROCESS,
+		SERVICE_AUTO_START,
+		SERVICE_ERROR_NORMAL,
+		buff,
+		NULL, NULL, NULL, NULL, NULL);
+	if (!service) {
+		DWORD err = GetLastError();
+		ShowWindowsError(TEXT("CreateService failed"), err);
+		return err;
+	}
+	MessageBox(NULL, TEXT("Installed service"), TEXT("Service was installed successfully"), MB_OK | MB_ICONINFORMATION);
+	return NO_ERROR;
 }
 
 void main() {
@@ -154,9 +191,16 @@ void main() {
 	LPCTSTR URL = TEXT("http://localhost:3000/shutdown");
 
 
-	createService();
+	retCode = EnablePrivileges();
+	if (retCode != NO_ERROR) {
+		ExitProcess(retCode);
+	}
 
-	enableShutdownPrivilege();
+	retCode = RegisterService();
+	if (retCode != NO_ERROR) {
+		ExitProcess(retCode);
+	}
+
 
 	retCode = HttpInitialize(HttpApiVersion, HTTP_INITIALIZE_SERVER, NULL);
 	if (retCode != NO_ERROR) {
