@@ -93,7 +93,7 @@ DWORD DoReceiveRequests(HANDLE hReqQueue) {
 			response.pReason = "OK";
 			response.ReasonLength = 2;
 		}
-		chunk.FromMemory.BufferLength = (ULONG) strlen(responseBuffer);
+		chunk.FromMemory.BufferLength = (ULONG)strlen(responseBuffer);
 		result = HttpSendHttpResponse(hReqQueue, pRequest->RequestId, 0, &response, NULL, NULL, NULL, 0, NULL, NULL);
 		if (result != NO_ERROR)
 			ShowError(TEXT("HttpSendHttpResponse failed"));
@@ -109,7 +109,7 @@ DWORD EnablePrivileges()
 	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken))
 		return GetLastError();
 
-	CONST TCHAR *privileges[2] = { SE_SHUTDOWN_NAME, SE_REMOTE_SHUTDOWN_NAME };
+	CONST TCHAR* privileges[2] = { SE_SHUTDOWN_NAME, SE_REMOTE_SHUTDOWN_NAME };
 	for (int i = 0; i < 2; i++) {
 		if (!LookupPrivilegeValue(L"", privileges[i], &luid))
 			return GetLastError();
@@ -138,7 +138,7 @@ DWORD RegisterService()
 	PWSTR pathBase = NULL;
 	SHGetKnownFolderPath(&FOLDERID_ProgramFiles, 0, NULL, &pathBase);
 	TCHAR buff[MAX_PATH];
-	
+
 	CONST TCHAR* walk = pathBase;
 	DWORD len = 0;
 	while (*walk)
@@ -155,12 +155,15 @@ DWORD RegisterService()
 		DWORD err = GetLastError();
 		if (err != ERROR_SERVICE_DOES_NOT_EXIST) {
 			ShowWindowsError(TEXT("Failed to open the old service"), err);
+			CloseServiceHandle(scManager);
 			return err;
 		}
-	} else {
+	}
+	else {
 		if (!DeleteService(oldService)) {
 			DWORD err = GetLastError();
 			ShowWindowsError(TEXT("Failed to delete old service"), err);
+			CloseServiceHandle(scManager);
 			return err;
 		}
 	}
@@ -180,27 +183,42 @@ DWORD RegisterService()
 		return err;
 	}
 	MessageBox(NULL, TEXT("Installed service"), TEXT("Service was installed successfully"), MB_OK | MB_ICONINFORMATION);
+	CloseServiceHandle(service);
+	CloseServiceHandle(scManager);
 	return NO_ERROR;
 }
 
-void main() {
+SERVICE_STATUS          gSvcStatus;
+SERVICE_STATUS_HANDLE   gSvcStatusHandle;
+
+DWORD WINAPI Handler(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext)
+{
+	return 0;
+}
+
+VOID WINAPI ServiceMain(DWORD dwNumServicesArgs, LPSTR* lpServiceArgVectors)
+{
 	ULONG           retCode;
 	HANDLE          hReqQueue = NULL;
 	int             UrlAdded = 0;
 	HTTPAPI_VERSION HttpApiVersion = HTTPAPI_VERSION_2;
 	LPCTSTR URL = TEXT("http://localhost:3000/shutdown");
 
+	gSvcStatusHandle = RegisterServiceCtrlHandlerEx(ServiceName, Handler, NULL);
+	if (!gSvcStatusHandle) {
+		ShowWindowsError(TEXT("RegisterServiceCtrlHandlerEx failed"), GetLastError());
+		return;
+	}
+
+	if (SetServiceStatus(gSvcStatusHandle, SERVICE_START_PENDING)) {
+		ShowWindowsError(TEXT("SetServiceStatus failed"), GetLastError());
+		return;
+	}
 
 	retCode = EnablePrivileges();
 	if (retCode != NO_ERROR) {
 		ExitProcess(retCode);
 	}
-
-	retCode = RegisterService();
-	if (retCode != NO_ERROR) {
-		ExitProcess(retCode);
-	}
-
 
 	retCode = HttpInitialize(HttpApiVersion, HTTP_INITIALIZE_SERVER, NULL);
 	if (retCode != NO_ERROR) {
@@ -226,5 +244,45 @@ CleanUp:
 
 	HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
 	ExitProcess(retCode);
+}
+
+//   Called by SCM whenever a control code is sent to the service
+//   using the ControlService function.
+VOID WINAPI SvcCtrlHandler(DWORD dwCtrl)
+{
+	switch (dwCtrl)
+	{
+	case SERVICE_CONTROL_STOP:
+		//ReportSvcStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
+
+		// Signal the service to stop.
+		//SetEvent(ghSvcStopEvent);
+		//ReportSvcStatus(gSvcStatus.dwCurrentState, NO_ERROR, 0);
+
+		return;
+
+	case SERVICE_CONTROL_INTERROGATE:
+		break;
+
+	default:
+		break;
+	}
+
+}
+
+
+void main() {
+	ULONG           retCode;
+	SERVICE_TABLE_ENTRY serviceStartTable[2] = { 0 };
+	serviceStartTable[0].lpServiceName = ServiceName;
+	serviceStartTable[0].lpServiceProc = ServiceMain;
+	if (!StartServiceCtrlDispatcher(&serviceStartTable)) {
+		// If we are not running as a service, register ourselves as one.
+		retCode = RegisterService();
+		if (retCode != NO_ERROR) {
+			ExitProcess(retCode);
+		}
+	}
+
 }
 
