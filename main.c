@@ -4,10 +4,56 @@
 
 #include <windows.h>
 #include <Shlobj.h>
+#include <Strsafe.h>
 #include <http.h>
 #include <stdio.h>
 
-static LPCTSTR ServiceName = TEXT("RemoteShutdown");
+static LPTSTR ServiceName = TEXT("RemoteShutdown");
+
+DWORD SvcReportEvent(LPTSTR szFunction)
+{
+	HANDLE hEventSource = NULL;
+	LPCTSTR lpszStrings[2] = { 0 };
+	TCHAR Buffer[1024];
+	TCHAR ErrorBuffer[512];
+	DWORD error = NO_ERROR;
+
+	hEventSource = RegisterEventSource(NULL, ServiceName);
+	error = GetLastError();
+
+	if (NULL != hEventSource)
+	{
+		FormatMessage(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, error, MAKELANGID(LANG_ENGLISH, SUBLANG_DEFAULT), ErrorBuffer, sizeof ErrorBuffer / sizeof(ErrorBuffer[0]), NULL);
+		CONST TCHAR* rwalk = szFunction;
+		TCHAR* wwalk = Buffer;
+		while (wwalk - Buffer < sizeof Buffer && *rwalk)
+			*wwalk++ = *rwalk++;
+		rwalk = TEXT(" failed with error: ");
+		while (wwalk - Buffer < sizeof Buffer && *rwalk)
+			*wwalk++ = *rwalk++;
+		rwalk = ErrorBuffer;
+		while (wwalk - Buffer < sizeof Buffer && *rwalk)
+			*wwalk++ = *rwalk++;
+		*wwalk++ = 0;
+
+
+		lpszStrings[0] = ServiceName;
+		lpszStrings[1] = Buffer;
+
+		//goto Skip;
+		ReportEvent(hEventSource,        // event log handle
+			EVENTLOG_WARNING_TYPE, // event type
+			0,                   // event category
+			0,           // event identifier
+			NULL,                // no security identifier
+			2,                   // size of lpszStrings array
+			0,                   // no binary data
+			lpszStrings,         // array of strings
+			NULL);               // no binary data
+		DeregisterEventSource(hEventSource);
+	}
+	return error;
+}
 
 static void ShowError(LPCTSTR error) {
 	MessageBox(NULL, error, TEXT("Error"), MB_OK | MB_ICONERROR);
@@ -49,6 +95,32 @@ size_t strlen(const char* str)
 }
 
 #pragma warning(pop)
+#else
+void* memcpy(void* dst, const void* src, size_t n)
+{
+	char* d = (char*)dst;
+	const char* s = (const char*)src;
+	for (size_t i = 0; i < n; i++)
+		d[i] = s[i];
+	return dst;
+}
+
+void* memset(void* dst, int c, size_t n)
+{
+	char* d = (char*)dst;
+	for (size_t i = 0; i < n; i++)
+		d[i] = c;
+	return dst;
+}
+
+size_t strlen(const char* str)
+{
+	char* s = (char*)str;
+	size_t n = 0;
+	for (; *s; s++)
+		n++;
+	return n;
+}
 #endif
 
 #pragma warning(push)
@@ -58,8 +130,14 @@ DWORD DoReceiveRequests(HANDLE hReqQueue) {
 		char RequestBuffer[sizeof(HTTP_REQUEST) + 2048] = { 0 };
 		PHTTP_REQUEST_V1 pRequest = (PHTTP_REQUEST_V1)RequestBuffer;
 		ULONG result = HttpReceiveHttpRequest(hReqQueue, 0, 0, (PHTTP_REQUEST)pRequest, sizeof RequestBuffer, NULL, NULL);
-		if (result != NO_ERROR)
+		// Request queue was shutdown, just return.
+		if (result == ERROR_OPERATION_ABORTED)
+			return NO_ERROR;
+		// Something else happened. TODO Log an event!
+		if (result != NO_ERROR) {
+			SvcReportEvent(TEXT("HttpReceiveHttpRequest"));
 			return result;
+		}
 
 		if (pRequest->Verb != HttpVerbPOST) {
 			HTTP_RESPONSE response = { 0 };
@@ -75,7 +153,7 @@ DWORD DoReceiveRequests(HANDLE hReqQueue) {
 
 		CHAR message[] = "Remote shutdown triggered";
 		CHAR responseBuffer[255] = { 0 };
-		BOOL ok = InitiateSystemShutdownExA(NULL, message, 100, TRUE, FALSE, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER);
+		BOOL ok = InitiateSystemShutdownExA(NULL, message, 3, TRUE, FALSE, SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_MINOR_OTHER);
 		HTTP_RESPONSE response = { 0 };
 		HTTP_DATA_CHUNK chunk = { 0 };
 		response.EntityChunkCount = 1;
@@ -102,28 +180,27 @@ DWORD DoReceiveRequests(HANDLE hReqQueue) {
 }
 #pragma warning(pop) 
 
+
 DWORD EnablePrivileges()
 {
 	HANDLE hToken = NULL;
 	LUID luid;
-	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken))
-		return GetLastError();
+	if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+		return SvcReportEvent(TEXT("OpenProcessToken"));
+	}
 
 	CONST TCHAR* privileges[2] = { SE_SHUTDOWN_NAME, SE_REMOTE_SHUTDOWN_NAME };
 	for (int i = 0; i < 2; i++) {
 		if (!LookupPrivilegeValue(L"", privileges[i], &luid))
-			return GetLastError();
+			return SvcReportEvent(TEXT("LookupPrivilegeValue"));
 		TOKEN_PRIVILEGES tp;
 		tp.PrivilegeCount = 1;
 		tp.Privileges[0].Luid = luid;
 		tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 		if (!AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, 0)) {
-			DWORD err = GetLastError();
-			ShowWindowsError(TEXT("AdjustTokenPrivileges failed"), err);
-			return err;
+			return SvcReportEvent(TEXT("AdjustTokenPrivileges"));
 		}
 	}
-
 	return NO_ERROR;
 }
 
@@ -166,6 +243,8 @@ DWORD RegisterService()
 			CloseServiceHandle(scManager);
 			return err;
 		}
+		// TODO remove workaround
+		Sleep(3000);
 	}
 	SC_HANDLE service = CreateService(
 		scManager,
@@ -191,50 +270,78 @@ DWORD RegisterService()
 SERVICE_STATUS          gSvcStatus;
 SERVICE_STATUS_HANDLE   gSvcStatusHandle;
 
-DWORD WINAPI Handler(DWORD dwControl, DWORD dwEventType, LPVOID lpEventData, LPVOID lpContext)
+HANDLE   hReqQueue = NULL;
+
+VOID WINAPI Handler(DWORD dwCtrl)
 {
-	return 0;
+	if (dwCtrl != SERVICE_CONTROL_STOP && dwCtrl != SERVICE_CONTROL_INTERROGATE)
+		return;
+	switch (gSvcStatus.dwCurrentState) {
+	case SERVICE_START_PENDING:
+	case SERVICE_STOP_PENDING:
+		gSvcStatus.dwCheckPoint++;
+		break;
+	case SERVICE_RUNNING:
+		if (dwCtrl == SERVICE_CONTROL_STOP) {
+			HttpShutdownRequestQueue(hReqQueue);
+			gSvcStatus.dwCurrentState = SERVICE_STOP_PENDING;
+		}
+		break;
+	}
+	SetServiceStatus(gSvcStatusHandle, &gSvcStatus);
 }
 
-VOID WINAPI ServiceMain(DWORD dwNumServicesArgs, LPSTR* lpServiceArgVectors)
+
+VOID WINAPI ServiceMain(DWORD dwNumServicesArgs, LPTSTR* lpServiceArgVectors)
 {
-	ULONG           retCode;
-	HANDLE          hReqQueue = NULL;
+	ULONG           retCode = 0;
 	int             UrlAdded = 0;
 	HTTPAPI_VERSION HttpApiVersion = HTTPAPI_VERSION_2;
 	LPCTSTR URL = TEXT("http://localhost:3000/shutdown");
 
-	gSvcStatusHandle = RegisterServiceCtrlHandlerEx(ServiceName, Handler, NULL);
+
+	hReqQueue = NULL;
+	ZeroMemory(&gSvcStatus, sizeof gSvcStatus);
+	gSvcStatusHandle = RegisterServiceCtrlHandler(ServiceName, Handler);
 	if (!gSvcStatusHandle) {
-		ShowWindowsError(TEXT("RegisterServiceCtrlHandlerEx failed"), GetLastError());
+		SvcReportEvent(TEXT("RegisterServiceCtrlHandlerEx"));
 		return;
 	}
+	gSvcStatus.dwCurrentState = SERVICE_START_PENDING;
+	gSvcStatus.dwControlsAccepted = SERVICE_ACCEPT_STOP;
+	gSvcStatus.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
+	gSvcStatus.dwWaitHint = 1000; // Any X_PENDING state should not last longer than a second.
 
-	if (SetServiceStatus(gSvcStatusHandle, SERVICE_START_PENDING)) {
-		ShowWindowsError(TEXT("SetServiceStatus failed"), GetLastError());
-		return;
+	if (!SetServiceStatus(gSvcStatusHandle, &gSvcStatus)) {
+		SvcReportEvent(TEXT("SetServiceStatus"));
+		goto Quit;
 	}
 
 	retCode = EnablePrivileges();
 	if (retCode != NO_ERROR) {
-		ExitProcess(retCode);
+		goto Quit;
 	}
 
 	retCode = HttpInitialize(HttpApiVersion, HTTP_INITIALIZE_SERVER, NULL);
 	if (retCode != NO_ERROR) {
-		ExitProcess(retCode);
+		goto Quit;
 	}
 
 	retCode = HttpCreateHttpHandle(&hReqQueue, 0);
 	if (retCode != NO_ERROR) {
-		goto CleanUp;
+		goto Quit;
 	}
 
 	retCode = HttpAddUrl(hReqQueue, URL, NULL);
 	if (retCode != NO_ERROR) {
 		goto CleanUp;
 	}
-	DoReceiveRequests(hReqQueue);
+	gSvcStatus.dwCurrentState = SERVICE_RUNNING;
+	SetServiceStatus(gSvcStatusHandle, &gSvcStatus);
+	retCode = DoReceiveRequests(hReqQueue);
+	if (retCode != NO_ERROR) {
+			SvcReportEvent(TEXT("DoReceiveRequests"));
+	}
 
 CleanUp:
 	HttpRemoveUrl(hReqQueue, URL);
@@ -243,46 +350,25 @@ CleanUp:
 	}
 
 	HttpTerminate(HTTP_INITIALIZE_SERVER, NULL);
+Quit:
+	gSvcStatus.dwCurrentState = SERVICE_STOPPED;
+	gSvcStatus.dwWin32ExitCode = retCode;
+	SetServiceStatus(gSvcStatusHandle, &gSvcStatus);
 	ExitProcess(retCode);
 }
 
-//   Called by SCM whenever a control code is sent to the service
-//   using the ControlService function.
-VOID WINAPI SvcCtrlHandler(DWORD dwCtrl)
+
+void main()
 {
-	switch (dwCtrl)
-	{
-	case SERVICE_CONTROL_STOP:
-		//ReportSvcStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
-
-		// Signal the service to stop.
-		//SetEvent(ghSvcStopEvent);
-		//ReportSvcStatus(gSvcStatus.dwCurrentState, NO_ERROR, 0);
-
-		return;
-
-	case SERVICE_CONTROL_INTERROGATE:
-		break;
-
-	default:
-		break;
-	}
-
-}
-
-
-void main() {
-	ULONG           retCode;
 	SERVICE_TABLE_ENTRY serviceStartTable[2] = { 0 };
 	serviceStartTable[0].lpServiceName = ServiceName;
 	serviceStartTable[0].lpServiceProc = ServiceMain;
-	if (!StartServiceCtrlDispatcher(&serviceStartTable)) {
+	if (!StartServiceCtrlDispatcher(serviceStartTable)) {
 		// If we are not running as a service, register ourselves as one.
-		retCode = RegisterService();
+		ULONG retCode = RegisterService();
 		if (retCode != NO_ERROR) {
 			ExitProcess(retCode);
 		}
 	}
-
 }
 
