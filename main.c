@@ -297,7 +297,7 @@ VOID WINAPI ServiceMain(DWORD dwNumServicesArgs, LPTSTR* lpServiceArgVectors)
 	ULONG           retCode = 0;
 	int             UrlAdded = 0;
 	HTTPAPI_VERSION HttpApiVersion = HTTPAPI_VERSION_2;
-	LPCTSTR URL = TEXT("http://localhost:3000/shutdown");
+	LPCTSTR URL = TEXT("http://+:3000/shutdown");
 
 
 	hReqQueue = NULL;
